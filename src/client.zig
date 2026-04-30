@@ -78,13 +78,13 @@ pub const Client = struct {
 
         for (0..self.max_retries + 1) |attempt| {
             if (attempt > 0) {
-                const base_ms: u64 = 500 * std.math.shl(u64, 1, @intCast(attempt - 1));
-                std.time.sleep(base_ms * std.time.ns_per_ms);
+                const shift: std.math.Log2Int(u64) = @intCast(attempt - 1);
+                const base_ms: u64 = 500 * std.math.shl(u64, 1, shift);
+                std.Thread.sleep(base_ms * std.time.ns_per_ms);
             }
 
             const url_str = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.base_url, path }) catch |e| return e;
             defer self.allocator.free(url_str);
-            const uri = std.Uri.parse(url_str) catch return ApiError.ConnectionError;
 
             var http_client = std.http.Client{ .allocator = self.allocator };
             defer http_client.deinit();
@@ -95,35 +95,33 @@ pub const Client = struct {
                 null;
             defer if (auth) |a| self.allocator.free(a);
 
-            var hdr_buf: [8192]u8 = undefined;
-            var req = http_client.open(method, uri, .{
-                .server_header_buffer = &hdr_buf,
-                .extra_headers = if (auth) |a|
-                    &.{ .{ .name = "authorization", .value = a }, .{ .name = "content-type", .value = "application/json" } }
-                else
-                    &.{ .{ .name = "content-type", .value = "application/json" } },
+            var resp_body: std.ArrayList(u8) = .{};
+            errdefer resp_body.deinit(self.allocator);
+
+            var old_writer = resp_body.writer(self.allocator);
+            var adapter_buf: [8192]u8 = undefined;
+            var adapter = old_writer.adaptToNewApi(&adapter_buf);
+
+            const extra_hdrs: []const std.http.Header = if (auth) |a|
+                &.{ .{ .name = "authorization", .value = a }, .{ .name = "content-type", .value = "application/json" } }
+            else
+                &.{ .{ .name = "content-type", .value = "application/json" } };
+
+            const result = http_client.fetch(.{
+                .location = .{ .url = url_str },
+                .method = method,
+                .payload = body_json,
+                .extra_headers = extra_hdrs,
+                .response_writer = &adapter.new_interface,
             }) catch return ApiError.ConnectionError;
-            defer req.deinit();
 
-            if (body_json) |b| req.transfer_encoding = .{ .content_length = b.len };
-            req.send() catch return ApiError.ConnectionError;
-            if (body_json) |b| req.writer().writeAll(b) catch return ApiError.ConnectionError;
-            req.finish() catch return ApiError.ConnectionError;
-            req.wait() catch return ApiError.ConnectionError;
+            adapter.new_interface.flush() catch {};
 
-            last_status = req.status;
-            if (isRetryable(req.status) and attempt < self.max_retries) continue;
-            try statusToError(req.status);
+            last_status = result.status;
+            if (isRetryable(result.status) and attempt < self.max_retries) continue;
+            try statusToError(result.status);
 
-            var resp_body = std.ArrayList(u8).init(self.allocator);
-            errdefer resp_body.deinit();
-            var buf: [4096]u8 = undefined;
-            while (true) {
-                const n = req.reader().read(&buf) catch return ApiError.ConnectionError;
-                if (n == 0) break;
-                resp_body.appendSlice(buf[0..n]) catch |e| return e;
-            }
-            return Response{ .status = req.status, .body = resp_body.toOwnedSlice() catch |e| return e, .allocator = self.allocator };
+            return Response{ .status = result.status, .body = resp_body.toOwnedSlice(self.allocator) catch |e| return e, .allocator = self.allocator };
         }
         try statusToError(last_status);
         return ApiError.ConnectionError;
@@ -133,24 +131,24 @@ pub const Client = struct {
     pub fn resize_vm_disk(self: *const Client, vm_id: []const u8, body: []const u8, skip_wait_boot: ?bool, opts: ?RequestOptions) !Response {
         const base_path = try std.fmt.allocPrint(self.allocator, "/api/v1/vm/{s}/disk", .{ vm_id });
         defer self.allocator.free(base_path);
-        var qbuf = std.ArrayList(u8).init(self.allocator);
-        defer qbuf.deinit();
-        try qbuf.appendSlice(base_path);
+        var qbuf: std.ArrayList(u8) = .{};
+        defer qbuf.deinit(self.allocator);
+        try qbuf.appendSlice(self.allocator, base_path);
         var sep: u8 = '?';
-        if (skip_wait_boot) |v| { try qbuf.append(sep); try qbuf.appendSlice("skip_wait_boot="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        const path = try qbuf.toOwnedSlice();
+        if (skip_wait_boot) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "skip_wait_boot="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        const path = try qbuf.toOwnedSlice(self.allocator);
         defer self.allocator.free(path);
         return self.doRequest(.PATCH, path, body, opts);
     }
 
     /// 
     pub fn create_new_root_vm(self: *const Client, body: []const u8, wait_boot: ?bool, opts: ?RequestOptions) !Response {
-        var qbuf = std.ArrayList(u8).init(self.allocator);
-        defer qbuf.deinit();
-        try qbuf.appendSlice("/api/v1/vm/new_root");
+        var qbuf: std.ArrayList(u8) = .{};
+        defer qbuf.deinit(self.allocator);
+        try qbuf.appendSlice(self.allocator, "/api/v1/vm/new_root");
         var sep: u8 = '?';
-        if (wait_boot) |v| { try qbuf.append(sep); try qbuf.appendSlice("wait_boot="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        const path = try qbuf.toOwnedSlice();
+        if (wait_boot) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "wait_boot="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        const path = try qbuf.toOwnedSlice(self.allocator);
         defer self.allocator.free(path);
         return self.doRequest(.POST, path, body, opts);
     }
@@ -159,12 +157,12 @@ pub const Client = struct {
     pub fn branch_by_ref(self: *const Client, repo_name: []const u8, tag_name: []const u8, body: []const u8, count: ?u32, opts: ?RequestOptions) !Response {
         const base_path = try std.fmt.allocPrint(self.allocator, "/api/v1/vm/branch/by_ref/{s}/{s}", .{ repo_name, tag_name });
         defer self.allocator.free(base_path);
-        var qbuf = std.ArrayList(u8).init(self.allocator);
-        defer qbuf.deinit();
-        try qbuf.appendSlice(base_path);
+        var qbuf: std.ArrayList(u8) = .{};
+        defer qbuf.deinit(self.allocator);
+        try qbuf.appendSlice(self.allocator, base_path);
         var sep: u8 = '?';
-        if (count) |v| { try qbuf.append(sep); try qbuf.appendSlice("count="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        const path = try qbuf.toOwnedSlice();
+        if (count) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "count="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        const path = try qbuf.toOwnedSlice(self.allocator);
         defer self.allocator.free(path);
         return self.doRequest(.POST, path, body, opts);
     }
@@ -185,12 +183,12 @@ pub const Client = struct {
     pub fn branch_by_tag(self: *const Client, tag_name: []const u8, body: []const u8, count: ?u32, opts: ?RequestOptions) !Response {
         const base_path = try std.fmt.allocPrint(self.allocator, "/api/v1/vm/branch/by_tag/{s}", .{ tag_name });
         defer self.allocator.free(base_path);
-        var qbuf = std.ArrayList(u8).init(self.allocator);
-        defer qbuf.deinit();
-        try qbuf.appendSlice(base_path);
+        var qbuf: std.ArrayList(u8) = .{};
+        defer qbuf.deinit(self.allocator);
+        try qbuf.appendSlice(self.allocator, base_path);
         var sep: u8 = '?';
-        if (count) |v| { try qbuf.append(sep); try qbuf.appendSlice("count="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        const path = try qbuf.toOwnedSlice();
+        if (count) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "count="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        const path = try qbuf.toOwnedSlice(self.allocator);
         defer self.allocator.free(path);
         return self.doRequest(.POST, path, body, opts);
     }
@@ -199,14 +197,14 @@ pub const Client = struct {
     pub fn branch_vm(self: *const Client, vm_or_commit_id: []const u8, body: []const u8, keep_paused: ?bool, skip_wait_boot: ?bool, count: ?u32, opts: ?RequestOptions) !Response {
         const base_path = try std.fmt.allocPrint(self.allocator, "/api/v1/vm/{s}/branch", .{ vm_or_commit_id });
         defer self.allocator.free(base_path);
-        var qbuf = std.ArrayList(u8).init(self.allocator);
-        defer qbuf.deinit();
-        try qbuf.appendSlice(base_path);
+        var qbuf: std.ArrayList(u8) = .{};
+        defer qbuf.deinit(self.allocator);
+        try qbuf.appendSlice(self.allocator, base_path);
         var sep: u8 = '?';
-        if (keep_paused) |v| { try qbuf.append(sep); try qbuf.appendSlice("keep_paused="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        if (skip_wait_boot) |v| { try qbuf.append(sep); try qbuf.appendSlice("skip_wait_boot="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        if (count) |v| { try qbuf.append(sep); try qbuf.appendSlice("count="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        const path = try qbuf.toOwnedSlice();
+        if (keep_paused) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "keep_paused="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        if (skip_wait_boot) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "skip_wait_boot="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        if (count) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "count="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        const path = try qbuf.toOwnedSlice(self.allocator);
         defer self.allocator.free(path);
         return self.doRequest(.POST, path, body, opts);
     }
@@ -257,12 +255,12 @@ pub const Client = struct {
     pub fn update_vm_state(self: *const Client, vm_id: []const u8, body: []const u8, skip_wait_boot: ?bool, opts: ?RequestOptions) !Response {
         const base_path = try std.fmt.allocPrint(self.allocator, "/api/v1/vm/{s}/state", .{ vm_id });
         defer self.allocator.free(base_path);
-        var qbuf = std.ArrayList(u8).init(self.allocator);
-        defer qbuf.deinit();
-        try qbuf.appendSlice(base_path);
+        var qbuf: std.ArrayList(u8) = .{};
+        defer qbuf.deinit(self.allocator);
+        try qbuf.appendSlice(self.allocator, base_path);
         var sep: u8 = '?';
-        if (skip_wait_boot) |v| { try qbuf.append(sep); try qbuf.appendSlice("skip_wait_boot="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        const path = try qbuf.toOwnedSlice();
+        if (skip_wait_boot) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "skip_wait_boot="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        const path = try qbuf.toOwnedSlice(self.allocator);
         defer self.allocator.free(path);
         return self.doRequest(.PATCH, path, body, opts);
     }
@@ -344,12 +342,12 @@ pub const Client = struct {
     pub fn delete_vm(self: *const Client, vm_id: []const u8, skip_wait_boot: ?bool, opts: ?RequestOptions) !Response {
         const base_path = try std.fmt.allocPrint(self.allocator, "/api/v1/vm/{s}", .{ vm_id });
         defer self.allocator.free(base_path);
-        var qbuf = std.ArrayList(u8).init(self.allocator);
-        defer qbuf.deinit();
-        try qbuf.appendSlice(base_path);
+        var qbuf: std.ArrayList(u8) = .{};
+        defer qbuf.deinit(self.allocator);
+        try qbuf.appendSlice(self.allocator, base_path);
         var sep: u8 = '?';
-        if (skip_wait_boot) |v| { try qbuf.append(sep); try qbuf.appendSlice("skip_wait_boot="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        const path = try qbuf.toOwnedSlice();
+        if (skip_wait_boot) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "skip_wait_boot="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        const path = try qbuf.toOwnedSlice(self.allocator);
         defer self.allocator.free(path);
         return self.doRequest(.DELETE, path, null, opts);
     }
@@ -384,14 +382,14 @@ pub const Client = struct {
     pub fn branch_by_vm(self: *const Client, vm_id: []const u8, body: []const u8, keep_paused: ?bool, skip_wait_boot: ?bool, count: ?u32, opts: ?RequestOptions) !Response {
         const base_path = try std.fmt.allocPrint(self.allocator, "/api/v1/vm/branch/by_vm/{s}", .{ vm_id });
         defer self.allocator.free(base_path);
-        var qbuf = std.ArrayList(u8).init(self.allocator);
-        defer qbuf.deinit();
-        try qbuf.appendSlice(base_path);
+        var qbuf: std.ArrayList(u8) = .{};
+        defer qbuf.deinit(self.allocator);
+        try qbuf.appendSlice(self.allocator, base_path);
         var sep: u8 = '?';
-        if (keep_paused) |v| { try qbuf.append(sep); try qbuf.appendSlice("keep_paused="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        if (skip_wait_boot) |v| { try qbuf.append(sep); try qbuf.appendSlice("skip_wait_boot="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        if (count) |v| { try qbuf.append(sep); try qbuf.appendSlice("count="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        const path = try qbuf.toOwnedSlice();
+        if (keep_paused) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "keep_paused="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        if (skip_wait_boot) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "skip_wait_boot="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        if (count) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "count="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        const path = try qbuf.toOwnedSlice(self.allocator);
         defer self.allocator.free(path);
         return self.doRequest(.POST, path, body, opts);
     }
@@ -414,13 +412,13 @@ pub const Client = struct {
     pub fn commit_vm(self: *const Client, vm_id: []const u8, body: []const u8, keep_paused: ?bool, skip_wait_boot: ?bool, opts: ?RequestOptions) !Response {
         const base_path = try std.fmt.allocPrint(self.allocator, "/api/v1/vm/{s}/commit", .{ vm_id });
         defer self.allocator.free(base_path);
-        var qbuf = std.ArrayList(u8).init(self.allocator);
-        defer qbuf.deinit();
-        try qbuf.appendSlice(base_path);
+        var qbuf: std.ArrayList(u8) = .{};
+        defer qbuf.deinit(self.allocator);
+        try qbuf.appendSlice(self.allocator, base_path);
         var sep: u8 = '?';
-        if (keep_paused) |v| { try qbuf.append(sep); try qbuf.appendSlice("keep_paused="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        if (skip_wait_boot) |v| { try qbuf.append(sep); try qbuf.appendSlice("skip_wait_boot="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        const path = try qbuf.toOwnedSlice();
+        if (keep_paused) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "keep_paused="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        if (skip_wait_boot) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "skip_wait_boot="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        const path = try qbuf.toOwnedSlice(self.allocator);
         defer self.allocator.free(path);
         return self.doRequest(.POST, path, body, opts);
     }
@@ -467,12 +465,12 @@ pub const Client = struct {
 
     /// 
     pub fn list_domains(self: *const Client, vm_id: ?[]const u8, opts: ?RequestOptions) !Response {
-        var qbuf = std.ArrayList(u8).init(self.allocator);
-        defer qbuf.deinit();
-        try qbuf.appendSlice("/api/v1/domains");
+        var qbuf: std.ArrayList(u8) = .{};
+        defer qbuf.deinit(self.allocator);
+        try qbuf.appendSlice(self.allocator, "/api/v1/domains");
         var sep: u8 = '?';
-        if (vm_id) |v| { try qbuf.append(sep); try qbuf.appendSlice("vm_id="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        const path = try qbuf.toOwnedSlice();
+        if (vm_id) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "vm_id="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        const path = try qbuf.toOwnedSlice(self.allocator);
         defer self.allocator.free(path);
         return self.doRequest(.GET, path, null, opts);
     }
@@ -500,12 +498,12 @@ pub const Client = struct {
     pub fn branch_by_commit(self: *const Client, commit_id: []const u8, body: []const u8, count: ?u32, opts: ?RequestOptions) !Response {
         const base_path = try std.fmt.allocPrint(self.allocator, "/api/v1/vm/branch/by_commit/{s}", .{ commit_id });
         defer self.allocator.free(base_path);
-        var qbuf = std.ArrayList(u8).init(self.allocator);
-        defer qbuf.deinit();
-        try qbuf.appendSlice(base_path);
+        var qbuf: std.ArrayList(u8) = .{};
+        defer qbuf.deinit(self.allocator);
+        try qbuf.appendSlice(self.allocator, base_path);
         var sep: u8 = '?';
-        if (count) |v| { try qbuf.append(sep); try qbuf.appendSlice("count="); try qbuf.appendSlice(try std.fmt.allocPrint(self.allocator, "{}", .{v})); sep = '&'; }
-        const path = try qbuf.toOwnedSlice();
+        if (count) |v| { try qbuf.append(self.allocator, sep); try qbuf.appendSlice(self.allocator, "count="); const vs = try std.fmt.allocPrint(self.allocator, "{}", .{v}); defer self.allocator.free(vs); try qbuf.appendSlice(self.allocator, vs); sep = '&'; }
+        const path = try qbuf.toOwnedSlice(self.allocator);
         defer self.allocator.free(path);
         return self.doRequest(.POST, path, body, opts);
     }
